@@ -1143,6 +1143,8 @@ sig_thread(void* arg)
     return 0;
 }
 
+#include <sys/prctl.h>
+
 int main(int argc, char** argv)
 {
     config_t               config;
@@ -1168,6 +1170,8 @@ int main(int argc, char** argv)
         perf_log_fatal("creating pipe");
 
     if (config.ng_engine) {
+        prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
+
         sigset_t set;
         pthread_t sigthread;
         sigfillset(&set);
