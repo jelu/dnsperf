@@ -87,6 +87,7 @@ typedef struct {
     bool               updates;
     bool               verbose;
     enum perf_net_mode mode;
+    bool ng_engine;
 } config_t;
 
 typedef struct {
@@ -438,6 +439,8 @@ setup(int argc, char** argv, config_t* config)
         NULL, &config->verbose);
     bool log_stdout = false;
     perf_opt_add('W', perf_opt_boolean, NULL, "log warnings and errors to stdout instead of stderr", NULL, &log_stdout);
+
+    perf_opt_add('N', perf_opt_boolean, 0, "Use next gen engine", 0, &config->ng_engine);
 
     perf_opt_parse(argc, argv);
 
@@ -1123,6 +1126,23 @@ threadinfo_cleanup(threadinfo_t* tinfo, times_t* times)
         times->end_time = tinfo->last_recv;
 }
 
+extern int dnsperf_engine(config_t*, perf_datafile_t*);
+
+static void*
+sig_thread(void* arg)
+{
+    sigset_t* set = (sigset_t*)arg;
+    int       sig, err;
+
+    if ((err = sigwait(set, &sig))) {
+        return 0;
+    }
+
+    printf("blocked sig %d\n", sig);
+
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     config_t               config;
@@ -1146,6 +1166,22 @@ int main(int argc, char** argv)
 
     if (pipe(threadpipe) < 0 || pipe(mainpipe) < 0 || pipe(intrpipe) < 0)
         perf_log_fatal("creating pipe");
+
+    if (config.ng_engine) {
+        sigset_t set;
+        pthread_t sigthread;
+        sigfillset(&set);
+        pthread_sigmask(SIG_BLOCK, &set, 0);
+        pthread_create(&sigthread, 0, &sig_thread, (void*)&set);
+
+        int ret = dnsperf_engine(&config, input);
+
+        cleanup(&config);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+        ERR_free_strings();
+#endif
+        return ret;
+    }
 
     perf_datafile_setpipefd(input, threadpipe[0]);
 

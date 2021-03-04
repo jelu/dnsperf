@@ -82,9 +82,9 @@ in_port_t perf_sockaddr_port(const perf_sockaddr_t* sockaddr)
 {
     switch (sockaddr->sa.sa.sa_family) {
     case AF_INET:
-        return sockaddr->sa.sin.sin_port;
+        return ntohs(sockaddr->sa.sin.sin_port);
     case AF_INET6:
-        return sockaddr->sa.sin6.sin6_port;
+        return ntohs(sockaddr->sa.sin6.sin6_port);
     default:
         break;
     }
@@ -95,10 +95,10 @@ void perf_sockaddr_setport(perf_sockaddr_t* sockaddr, in_port_t port)
 {
     switch (sockaddr->sa.sa.sa_family) {
     case AF_INET:
-        sockaddr->sa.sin.sin_port = port;
+        sockaddr->sa.sin.sin_port = htons(port);
         break;
     case AF_INET6:
-        sockaddr->sa.sin6.sin6_port = port;
+        sockaddr->sa.sin6.sin6_port = htons(port);
         break;
     default:
         break;
