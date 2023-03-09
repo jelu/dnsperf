@@ -102,6 +102,7 @@ typedef struct {
 #ifdef USE_HISTOGRAMS
     bool latency_histogram;
 #endif
+    size_t qps_threshold_wait;
 } config_t;
 
 typedef struct {
@@ -559,6 +560,8 @@ setup(int argc, char** argv, config_t* config)
     config->max_outstanding = DEFAULT_MAX_OUTSTANDING;
     config->mode            = sock_udp;
 
+    config->qps_threshold_wait = 75;
+
     perf_opt_add('f', perf_opt_string, "family",
         "address family of DNS transport, inet or inet6", "any",
         &family);
@@ -637,6 +640,8 @@ setup(int argc, char** argv, config_t* config)
     perf_long_opt_add("latency-histogram", perf_opt_boolean, NULL,
         "collect and print detailed latency histograms", NULL, &config->latency_histogram);
 #endif
+    perf_long_opt_add("qps-threshold-wait", perf_opt_zpint, "microseconds",
+        "minimum threshold for enabling wait in rate limiting", stringify(config->qps_threshold_wait), &config->qps_threshold_wait);
 
     bool log_stdout = false;
     perf_opt_add('W', perf_opt_boolean, NULL, "log warnings and errors to stdout instead of stderr", NULL, &log_stdout);
@@ -803,7 +808,7 @@ do_send(void* arg)
     stats_t*        stats;
     unsigned int    max_packet_size;
     perf_buffer_t   msg;
-    uint64_t        now, run_time, req_time;
+    uint64_t        now, run_time, req_time, qps_sent, last_qps;
     char            input_data[MAX_INPUT_DATA];
     perf_buffer_t   lines;
     perf_region_t   used;
@@ -825,23 +830,50 @@ do_send(void* arg)
     perf_buffer_init(&lines, input_data, sizeof(input_data));
 
     wait_for_start();
-    now = perf_get_time();
+    now      = perf_get_time();
+    last_qps = now;
+    qps_sent = 0;
     while (!interrupted && now < times->stop_time) {
         /* Avoid flooding the network too quickly. */
         if (stats->num_sent < tinfo->max_outstanding && stats->num_sent % 2 == 1) {
-            if (stats->num_completed == 0)
-                usleep(1000);
-            else
+            if (stats->num_completed == 0) {
+                struct timespec ts = { 0, MILLION };
+                nanosleep(&ts, 0);
+            } else
                 sleep(0);
             now = perf_get_time();
         }
 
-        /* Rate limiting */
+        /* Rate limiting is done within a 1 second window (last_qps to now)
+         * by checking the current window size (run_time) against how big
+         * it should be w.r.t. how many queries has been sent (req_time).
+         * If the window is too small (sending faster then it should) then
+         * it will sleep for a while to widen it.
+         */
         if (tinfo->max_qps > 0) {
-            run_time = now - times->start_time;
-            req_time = (MILLION * stats->num_sent) / tinfo->max_qps;
+            run_time = now - last_qps;
+            if (run_time > MILLION) {
+                last_qps += MILLION;
+                run_time -= MILLION;
+                if (qps_sent > tinfo->max_qps)
+                    qps_sent -= tinfo->max_qps;
+                else
+                    qps_sent = 0;
+            }
+            req_time = (MILLION * qps_sent) / tinfo->max_qps;
             if (req_time > run_time) {
-                usleep(req_time - run_time);
+                req_time -= run_time;
+                if (config->qps_threshold_wait && req_time > config->qps_threshold_wait) {
+                    struct timespec ts;
+                    if (req_time >= MILLION) {
+                        ts.tv_sec  = req_time / MILLION;
+                        ts.tv_nsec = (req_time % MILLION) * 1000;
+                    } else {
+                        ts.tv_sec  = 0;
+                        ts.tv_nsec = req_time * 1000;
+                    }
+                    nanosleep(&ts, 0);
+                }
                 now = perf_get_time();
                 continue;
             }
@@ -980,6 +1012,7 @@ do_send(void* arg)
             continue;
         }
         stats->num_sent++;
+        qps_sent++;
 
         stats->total_request_size += length;
     }
