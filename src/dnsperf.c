@@ -102,7 +102,7 @@ typedef struct {
 #ifdef USE_HISTOGRAMS
     bool latency_histogram;
 #endif
-    size_t qps_threshold_wait;
+    int qps_threshold_wait;
 } config_t;
 
 typedef struct {
@@ -533,6 +533,43 @@ stringify(unsigned int value)
     return buf;
 }
 
+static int
+measure_nanosleep(config_t* config)
+{
+    struct timespec start, stop, wait = { 0, 0 };
+    int             err;
+
+    int i = 100;
+    if ((err = clock_gettime(CLOCK_REALTIME, &start))) {
+        return err;
+    }
+    for (; i; i--) {
+        if ((err = clock_gettime(CLOCK_REALTIME, &stop))) {
+            return err;
+        }
+    }
+    long int gettime_duration = (stop.tv_sec - start.tv_sec) * 1000000000 + stop.tv_nsec - start.tv_nsec;
+
+    i = 100;
+    if ((err = clock_gettime(CLOCK_REALTIME, &start))) {
+        return err;
+    }
+    for (; i; i--) {
+        if ((err = nanosleep(&wait, NULL))) {
+            return err;
+        }
+    }
+    if ((err = clock_gettime(CLOCK_REALTIME, &stop))) {
+        return err;
+    }
+
+    config->qps_threshold_wait = (((stop.tv_sec - start.tv_sec) * 1000000000 + stop.tv_nsec - start.tv_nsec)
+                                     - 2 * gettime_duration)
+                                 / 100 / 1000;
+
+    return 0;
+}
+
 static void
 setup(int argc, char** argv, config_t* config)
 {
@@ -560,7 +597,7 @@ setup(int argc, char** argv, config_t* config)
     config->max_outstanding = DEFAULT_MAX_OUTSTANDING;
     config->mode            = sock_udp;
 
-    config->qps_threshold_wait = 75;
+    config->qps_threshold_wait = -1;
 
     perf_opt_add('f', perf_opt_string, "family",
         "address family of DNS transport, inet or inet6", "any",
@@ -735,6 +772,14 @@ setup(int argc, char** argv, config_t* config)
         perf_log_fatal("Unable to dynamic update, support not built in");
     }
 #endif
+
+    if (config->qps_threshold_wait < 0) {
+        int err = measure_nanosleep(config);
+        if (err) {
+            char __s[256];
+            perf_log_fatal("Unable to measure nanosleep(): %s", perf_strerror_r(errno, __s, sizeof(__s)));
+        }
+    }
 }
 
 static void
