@@ -874,6 +874,7 @@ do_send(void* arg)
     if (tinfo->max_qps > 0) {
         q_step = MILLION / tinfo->max_qps;
     }
+    // printf("%lu %d\n", q_step, config->qps_threshold_wait);
 
     wait_for_start();
     now     = perf_get_time();
@@ -891,6 +892,7 @@ do_send(void* arg)
 
         if (tinfo->max_qps > 0) {
             if (q_reset < now) {
+                // printf("sent %lu\n", q_sent);
                 q_reset += MILLION;
                 q_sent = 0;
             } else if (q_sent >= tinfo->max_qps) {
@@ -1008,31 +1010,39 @@ do_send(void* arg)
         now = perf_get_time();
         /* If -Q is used, check if we are suppose to send this now or wait a bit */
         if (tinfo->max_qps > 0) {
-            if (next_send && next_send > now) {
-                uint64_t next_us = next_send - now;
-                if (config->qps_threshold_wait && next_us > config->qps_threshold_wait) {
-                    next_us -= config->qps_threshold_wait;
-                    struct timespec ts;
-                    if (next_us >= MILLION) {
-                        ts.tv_sec  = next_us / MILLION;
-                        ts.tv_nsec = (next_us % MILLION) * 1000;
-                    } else {
-                        ts.tv_sec  = 0;
-                        ts.tv_nsec = next_us * 1000;
+            if (next_send) {// && next_send > now) {
+                while (next_send > now) {
+                    uint64_t next_us = next_send - now;
+                    if (config->qps_threshold_wait && next_us > config->qps_threshold_wait) {
+                        next_us -= config->qps_threshold_wait;
+                        struct timespec ts;
+                        if (next_us >= MILLION) {
+                            ts.tv_sec  = next_us / MILLION;
+                            ts.tv_nsec = (next_us % MILLION) * 1000;
+                        } else {
+                            ts.tv_sec  = 0;
+                            ts.tv_nsec = next_us * 1000;
+                        }
+                // if (!q_sent) {
+                //     printf("sleep %lu.%lu\n", ts.tv_sec, ts.tv_nsec);
+                // }
+                        nanosleep(&ts, 0);
                     }
-                    nanosleep(&ts, 0);
+                    now = perf_get_time();
+                // if (!q_sent) {
+                //     printf("next_send %lu, now %lu, next_us %ld\n", next_send, now, next_send - now);
+                // }
                 }
-                now = perf_get_time();
             }
-            next_send = now + q_step;
+            next_send = now + q_step - 1;
 
-            // abort send if we passed stop time
-            if (times->stop_time < now) {
-                PERF_LOCK(&tinfo->lock);
-                query_move(tinfo, q, prepend_unused);
-                PERF_UNLOCK(&tinfo->lock);
-                continue;
-            }
+            // // abort send if we passed stop time
+            // if (times->stop_time < now) {
+            //     PERF_LOCK(&tinfo->lock);
+            //     query_move(tinfo, q, prepend_unused);
+            //     PERF_UNLOCK(&tinfo->lock);
+            //     continue;
+            // }
         }
         if (config->verbose) {
             free(q->desc);
@@ -1087,6 +1097,8 @@ do_send(void* arg)
             }
         }
     }
+
+    // printf("sent %lu\n", q_sent);
 
     tinfo->done_send_time = perf_get_time();
     tinfo->done_sending   = true;
