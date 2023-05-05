@@ -544,17 +544,6 @@ measure_nanosleep(config_t* config)
         return err;
     }
     for (; i; i--) {
-        if ((err = clock_gettime(CLOCK_REALTIME, &stop))) {
-            return err;
-        }
-    }
-    long int gettime_duration = (stop.tv_sec - start.tv_sec) * 1000000000 + stop.tv_nsec - start.tv_nsec;
-
-    i = 100;
-    if ((err = clock_gettime(CLOCK_REALTIME, &start))) {
-        return err;
-    }
-    for (; i; i--) {
         if ((err = nanosleep(&wait, NULL))) {
             return err;
         }
@@ -563,9 +552,17 @@ measure_nanosleep(config_t* config)
         return err;
     }
 
-    config->qps_threshold_wait = (((stop.tv_sec - start.tv_sec) * 1000000000 + stop.tv_nsec - start.tv_nsec)
-                                     - 2 * gettime_duration)
-                                 / 100 / 1000;
+    // Total time for 100 nanosleep() + 2 clock_gettime()
+    config->qps_threshold_wait = ((stop.tv_sec - start.tv_sec) * 1000000000 + stop.tv_nsec - start.tv_nsec)
+                                 // divided by 100 runs
+                                 / 100
+                                 // add fudge
+                                 * 3
+                                 // converted to microseconds
+                                 / 1000;
+    if (config->qps_threshold_wait < 0) {
+        config->qps_threshold_wait = 0;
+    }
 
     return 0;
 }
@@ -853,7 +850,7 @@ do_send(void* arg)
     stats_t*        stats;
     unsigned int    max_packet_size;
     perf_buffer_t   msg;
-    uint64_t        now, run_time, req_time, qps_sent, last_qps;
+    uint64_t        now, next_send = 0, q_step = 0, q_sent = 0, q_reset;
     char            input_data[MAX_INPUT_DATA];
     perf_buffer_t   lines;
     perf_region_t   used;
@@ -874,10 +871,13 @@ do_send(void* arg)
     perf_buffer_init(&msg, packet_buffer, max_packet_size);
     perf_buffer_init(&lines, input_data, sizeof(input_data));
 
+    if (tinfo->max_qps > 0) {
+        q_step = MILLION / tinfo->max_qps;
+    }
+
     wait_for_start();
-    now      = perf_get_time();
-    last_qps = now;
-    qps_sent = 0;
+    now     = perf_get_time();
+    q_reset = now + MILLION;
     while (!interrupted && now < times->stop_time) {
         /* Avoid flooding the network too quickly. */
         if (stats->num_sent < tinfo->max_outstanding && stats->num_sent % 2 == 1) {
@@ -889,33 +889,22 @@ do_send(void* arg)
             now = perf_get_time();
         }
 
-        /* Rate limiting is done within a 1 second window (last_qps to now)
-         * by checking the current window size (run_time) against how big
-         * it should be w.r.t. how many queries has been sent (req_time).
-         * If the window is too small (sending faster then it should) then
-         * it will sleep for a while to widen it.
-         */
         if (tinfo->max_qps > 0) {
-            run_time = now - last_qps;
-            if (run_time > MILLION) {
-                last_qps += MILLION;
-                run_time -= MILLION;
-                if (qps_sent > tinfo->max_qps)
-                    qps_sent -= tinfo->max_qps;
-                else
-                    qps_sent = 0;
-            }
-            req_time = (MILLION * qps_sent) / tinfo->max_qps;
-            if (req_time > run_time) {
-                req_time -= run_time;
-                if (config->qps_threshold_wait && req_time > config->qps_threshold_wait) {
+            if (q_reset < now) {
+                q_reset += MILLION;
+                q_sent = 0;
+            } else if (q_sent >= tinfo->max_qps) {
+                // max qps hit for this second slice, wait for next
+                uint64_t next_us = q_reset - now;
+                if (config->qps_threshold_wait && next_us > config->qps_threshold_wait) {
+                    next_us -= config->qps_threshold_wait;
                     struct timespec ts;
-                    if (req_time >= MILLION) {
-                        ts.tv_sec  = req_time / MILLION;
-                        ts.tv_nsec = (req_time % MILLION) * 1000;
+                    if (next_us >= MILLION) {
+                        ts.tv_sec  = next_us / MILLION;
+                        ts.tv_nsec = (next_us % MILLION) * 1000;
                     } else {
                         ts.tv_sec  = 0;
-                        ts.tv_nsec = req_time * 1000;
+                        ts.tv_nsec = next_us * 1000;
                     }
                     nanosleep(&ts, 0);
                 }
@@ -1017,6 +1006,34 @@ do_send(void* arg)
         length = perf_buffer_usedlength(send);
 
         now = perf_get_time();
+        /* If -Q is used, check if we are suppose to send this now or wait a bit */
+        if (tinfo->max_qps > 0) {
+            if (next_send && next_send > now) {
+                uint64_t next_us = next_send - now;
+                if (config->qps_threshold_wait && next_us > config->qps_threshold_wait) {
+                    next_us -= config->qps_threshold_wait;
+                    struct timespec ts;
+                    if (next_us >= MILLION) {
+                        ts.tv_sec  = next_us / MILLION;
+                        ts.tv_nsec = (next_us % MILLION) * 1000;
+                    } else {
+                        ts.tv_sec  = 0;
+                        ts.tv_nsec = next_us * 1000;
+                    }
+                    nanosleep(&ts, 0);
+                }
+                now = perf_get_time();
+            }
+            next_send = now + q_step;
+
+            // abort send if we passed stop time
+            if (times->stop_time < now) {
+                PERF_LOCK(&tinfo->lock);
+                query_move(tinfo, q, prepend_unused);
+                PERF_UNLOCK(&tinfo->lock);
+                continue;
+            }
+        }
         if (config->verbose) {
             free(q->desc);
             if (config->input_format == input_format_tcp_wire_format) {
@@ -1057,7 +1074,7 @@ do_send(void* arg)
             continue;
         }
         stats->num_sent++;
-        qps_sent++;
+        q_sent++;
 
         stats->total_request_size += length;
     }
