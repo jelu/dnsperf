@@ -43,6 +43,7 @@ struct perf__dot_socket {
 
     pthread_mutex_t lock;
     SSL*            ssl;
+    SSL_SESSION*    session;
 
     char   recvbuf[TCP_RECV_BUF_SIZE], sendbuf[TCP_SEND_BUF_SIZE];
     size_t at, sending;
@@ -59,6 +60,8 @@ struct perf__dot_socket {
     size_t       num_queries_per_conn, nqpc_timeout;
     unsigned int nqpc_sent, nqpc_recv;
     uint64_t     nqpc_ts;
+
+    uint64_t     handshakes_full, handshakes_resumed;
 };
 
 static void perf__dot_connect(struct perf_net_socket* sock)
@@ -81,6 +84,13 @@ static void perf__dot_connect(struct perf_net_socket* sock)
     }
     if (!(self->ssl = SSL_new(ssl_ctx))) {
         perf_log_fatal("SSL_new(): %s", ERR_error_string(ERR_get_error(), 0));
+    }
+
+    if (self ->session) {
+        int set_ok = SSL_set_session(self->ssl, self->session);
+        if (set_ok != 1) {
+            perf_log_debug("SSL_set_session() failed, doing full handshake: %s", ERR_error_string(ERR_get_error(), 0));
+        }
     }
     if (perf_net_tls_sni && !(ret = SSL_set_tlsext_host_name(self->ssl, perf_net_tls_sni))) {
         perf_log_fatal("SSL_set_tlsext_host_name(): %s", ERR_error_string(SSL_get_error(self->ssl, ret), 0));
@@ -311,7 +321,17 @@ static ssize_t perf__dot_sendto(struct perf_net_socket* sock, uint16_t qid, cons
 
 static int perf__dot_close(struct perf_net_socket* sock)
 {
-    // TODO
+    
+    PERF_LOCK(&self->lock);
+    if (self->session) {
+        SSL_SESSION_free(self->session);
+        self->session = NULL;
+    }
+    if (self->ssl) {
+        SSL_free(self->ssl);
+        self->ssl = NULL;
+    }
+    PERF_UNLOCK(&self->lock);
     return close(sock->fd);
 }
 
@@ -436,6 +456,26 @@ static int perf__dot_sockready(struct perf_net_socket* sock, int pipe_fd, int64_
         PERF_UNLOCK(&self->lock);
         return 0;
     }
+
+    if (SSL_session_reused(self->ssl)) {
+        self->handshakes_resumed++;
+        perf_log_debug("DoT handshake resumed");
+    } else {
+        self->handshakes_full++;
+        perf_log_debug("DoT full handshake");
+    }
+
+    {
+        SSL_SESSION* new_sess = SSL_get1_session(self->ssl);
+        if (!new_sess) {
+            perf_log_debug("SSL_get1_session() returned NULL");
+        } else {
+            if (self->session) {
+                SSL_SESSION_free(self->session);
+            }
+            self->session = new_sess;
+        }
+    }
     self->is_ready = true;
     PERF_UNLOCK(&self->lock);
     if (sock->event) {
@@ -506,6 +546,7 @@ struct perf_net_socket* perf_net_dot_opensocket(const perf_sockaddr_t* server, c
         }
 #endif
         SSL_CTX_set_mode(ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE);
+        (void)SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_CLIENT);
     }
 
     perf__dot_connect(sock);
